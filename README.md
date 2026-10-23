@@ -2,7 +2,7 @@
 
 Give every tiled window on the current Hyprland workspace an equal share of the screen.
 
-![Six windows of different sizes snapping into an even 3x2 grid after one press of Super+Shift+J](demo.gif)
+![Six windows of different sizes snapping into an even 3x2 grid after one press of Super+Shift+J](https://raw.githubusercontent.com/derekross/hypr-equalize/main/demo.gif)
 
 Hyprland's dwindle layout is a binary tree, so `splitratio 1` only evens out a
 single split. `hypr-equalize` makes every tiled window the same size:

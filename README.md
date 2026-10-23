@@ -3,11 +3,14 @@
 Give every tiled window on the current Hyprland workspace an equal share of the screen.
 
 Hyprland's dwindle layout is a binary tree, so `splitratio 1` only evens out a
-single split. `hypr-equalize` looks at the whole workspace instead:
+single split. `hypr-equalize` rebuilds the workspace's rows and columns from
+window geometry and evens out all of them:
 
 - **Side-by-side windows** get equal widths.
 - **Stacked windows** get equal heights.
-- **A mixed grid** gets every split set to 50/50.
+- **A mixed grid** gets each row or column split evenly between the groups in
+  it. Three columns of stacked windows become three equal columns, each split
+  evenly top to bottom.
 
 Focus goes back to the window you were on.
 
@@ -22,11 +25,12 @@ nearly the whole screen.
 So `hypr-equalize`:
 
 1. **Probes:** nudges each window by a few pixels and measures which divider
-   actually moves, and in which direction.
+   actually moves, and in which direction. This also reaches dividers that no
+   window sits directly beside, which `splitratio` can't touch.
 2. **Converges:** moves every divider to its equal-share position and repeats
    until each one is within 2px.
-3. **Restructures if needed:** if a divider has no window directly beside it in
-   the tree (for example `(A | B) | (C | D)`), it hoists the first window to the
+3. **Restructures if needed:** if a single row or column has a divider that no
+   resize moves (for example `(A | B) | (C | D)`), it hoists the first window to the
    root with `movetoroot`, then swaps the windows back into their original
    order.
 

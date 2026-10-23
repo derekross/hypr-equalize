@@ -2,9 +2,10 @@
 """Give every tiled window on the focused workspace an equal share.
 
 Dwindle is a binary tree, so `splitratio 1` only evens out one split. This
-walks every tiled window instead: side-by-side windows get equal widths,
-stacked windows get equal heights, and a mixed grid gets every split set to
-50/50. Focus is put back where it was.
+rebuilds the layout's rows and columns from window geometry and evens out
+every one: side-by-side windows get equal widths, stacked windows get equal
+heights, and in a mixed grid each row or column is split evenly between the
+groups in it. Focus is put back where it was.
 
 Hyprland on Omarchy takes dispatches as Lua (hl.dsp.*), so that is what
 this sends.
@@ -46,22 +47,50 @@ def tiled_windows():
     ]
 
 
-def overlaps(a0, a1, b0, b1):
-    return min(a1, b1) - max(a0, b0) > 8
+def span(w, axis):
+    return w["at"][axis], w["at"][axis] + w["size"][axis]
 
 
-def arrangement(wins):
-    """columns: no two windows share horizontal space; rows: none share vertical."""
-    cols = rows = True
-    for i, a in enumerate(wins):
-        for b in wins[i + 1:]:
-            ax, ay = a["at"]; aw, ah = a["size"]
-            bx, by = b["at"]; bw, bh = b["size"]
-            if overlaps(ax, ax + aw, bx, bx + bw):
-                cols = False
-            if overlaps(ay, ay + ah, by, by + bh):
-                rows = False
-    return "columns" if cols else "rows" if rows else "grid"
+def split_tree(wins):
+    """Rebuild the layout as nested rows and columns from window geometry.
+
+    A tiled layout always splits cleanly: some line runs edge to edge across
+    the region without cutting a window. A node is (axis, [children]); runs of
+    the same split direction are flattened, so (A|B)|C is one node of three.
+    A leaf is a window address.
+    """
+    if len(wins) == 1:
+        return wins[0]["address"]
+    for axis in (0, 1):
+        ordered = sorted(wins, key=lambda w: w["at"][axis])
+        groups = [[ordered[0]]]
+        reach = span(ordered[0], axis)[1]
+        for w in ordered[1:]:
+            if w["at"][axis] >= reach - 2:
+                groups.append([w])
+            else:
+                groups[-1].append(w)
+            reach = max(reach, span(w, axis)[1])
+        if len(groups) > 1:
+            return axis, [split_tree(g) for g in groups]
+    raise RuntimeError("windows don't form a tiled layout")
+
+
+def leaves(node):
+    return [node] if isinstance(node, str) else [a for c in node[1] for a in leaves(c)]
+
+
+def dividers(node, out=None):
+    """Every divider as (axis, its row or column as lists of windows, index of
+    the child it starts), outermost first."""
+    out = [] if out is None else out
+    if not isinstance(node, str):
+        axis, children = node
+        members = [leaves(c) for c in children]
+        out += [(axis, members, i) for i in range(1, len(children))]
+        for c in children:
+            dividers(c, out)
+    return out
 
 
 def set_smart_resizing(on):
@@ -74,74 +103,92 @@ def resize_by(address, dx, dy):
     dispatch(focus(address), f"hl.dsp.window.resize({{ x = {dx}, y = {dy}, relative = true }})")
 
 
-def equalize_line(shape):
-    """Line windows up by moving each split boundary to its equal-share spot.
+def equalize(tree):
+    """Move every divider to the spot that gives its row or column equal shares.
 
-    A resize moves the window's parent split, but which way depends on where
-    the window sits in the dwindle tree (for some windows "grow" shrinks them),
-    so absolute per-window resizes can run away to the split clamp. Instead,
-    probe each window once to learn which boundary it moves and in which
-    direction, then drive every boundary to its target.
+    A resize moves one of the window's ancestor splits, but which one, and
+    which way, depends on where the window sits in the dwindle tree (for some
+    windows "grow" shrinks them), so absolute per-window resizes can run away
+    to the split clamp. Instead, nudge each window to learn which divider it
+    moves and in which direction, then drive every divider to its target.
     """
-    axis = 0 if shape == "columns" else 1
     PROBE = 40
+    divs = dividers(tree)
 
-    def layout():
-        wins = sorted(tiled_windows(), key=lambda w: (w["at"][axis], w["at"][1 - axis]))
-        return wins, [w["at"][axis] for w in wins[1:]]
+    def geometry():
+        return {w["address"]: w for w in tiled_windows()}
 
-    def nudge(address, d):
+    def position(div, g):
+        axis, members, i = div
+        return min(g[a]["at"][axis] for a in members[i])
+
+    def nudge(address, axis, d):
         resize_by(address, d, 0) if axis == 0 else resize_by(address, 0, d)
 
     def probe():
-        controls = {}  # boundary index -> (address, boundary px moved per px of resize)
-        for w in layout()[0]:
-            for d in (PROBE, -PROBE):
-                before = layout()[1]
-                nudge(w["address"], d)
-                after = layout()[1]
-                nudge(w["address"], -d)
-                moved = [a - b for a, b in zip(after, before)]
-                k = max(range(len(moved)), key=lambda i: abs(moved[i]))
-                if abs(moved[k]) >= PROBE / 4:
-                    controls.setdefault(k, (w["address"], moved[k] / d))
+        controls = {}  # divider index -> (address, axis, divider px moved per px of resize)
+        fallback = {}
+        for address in leaves(tree):
+            for axis in {d[0] for d in divs}:
+                for d in (PROBE, -PROBE):
+                    g = geometry()
+                    before = [position(v, g) for v in divs]
+                    nudge(address, axis, d)
+                    g = geometry()
+                    moved = [position(v, g) - b for v, b in zip(divs, before)]
+                    nudge(address, axis, -d)
+                    k = max(range(len(moved)), key=lambda i: abs(moved[i]))
+                    if abs(moved[k]) < PROBE / 4:
+                        continue
+                    controls.setdefault(k, (address, axis, moved[k] / d))
+                    for i, m in enumerate(moved):
+                        if abs(m) >= PROBE / 4 and abs(m) > abs(fallback.get(i, (0, 0, 0))[2] * d):
+                            fallback[i] = (address, axis, m / d)
                     break
-        return controls
+        # A divider that only ever moves alongside a bigger one can still be
+        # driven by whichever window moves it most.
+        return {**fallback, **controls}
 
-    n = len(layout()[0])
     controls = probe()
-    if len(controls) < n - 1:
+    if len(controls) < len(divs) and all(isinstance(c, str) for c in tree[1]):
         # A split with no window directly under it (e.g. (A|B)|(C|D)) can't be
         # resized. Hoisting the first window to the root rebuilds the tree so
         # every split has one; swaps then put the windows back in order.
-        order = [w["address"] for w in layout()[0]]
+        axis, order = tree
+        n = len(order)
+
+        def line():
+            g = geometry()
+            return sorted(order, key=lambda a: (g[a]["at"][axis], g[a]["at"][1 - axis]))
+
         dispatch(focus(order[0]), 'hl.dsp.layout("movetoroot")')
         step = "l" if axis == 0 else "u"
         for i, address in enumerate(order):
             for _ in range(n):
-                now = [w["address"] for w in layout()[0]]
-                if now.index(address) <= i:
+                if line().index(address) <= i:
                     break
                 dispatch(focus(address), f'hl.dsp.window.swap({{ direction = "{step}" }})')
         controls = probe()
 
-    for _ in range(6):
-        wins, bounds = layout()
-        start = wins[0]["at"][axis]
-        end = wins[-1]["at"][axis] + wins[-1]["size"][axis]
-        gap = bounds[0] - (wins[0]["at"][axis] + wins[0]["size"][axis])
-        share = (end - start - gap * (n - 1)) / n
+    for _ in range(8):
         worst = 0
-        for k, (address, rate) in sorted(controls.items()):
-            target = start + (k + 1) * (share + gap)
-            err = target - layout()[1][k]
+        for k, (address, axis, rate) in sorted(controls.items()):
+            g = geometry()
+            # Targets come from the divider's own row or column, re-measured
+            # each time since moving an outer divider rescales the inner ones.
+            _, members, i = divs[k]
+            start = min(g[a]["at"][axis] for a in members[0])
+            end = max(span(g[a], axis)[1] for a in members[-1])
+            gap = min(g[a]["at"][axis] for a in members[1]) - max(span(g[a], axis)[1] for a in members[0])
+            share = (end - start - gap * (len(members) - 1)) / len(members)
+            err = start + i * (share + gap) - position(divs[k], g)
             worst = max(worst, abs(err))
             if abs(err) > 2:
-                nudge(address, round(err / rate))
+                nudge(address, axis, round(err / rate))
         if worst <= 2:
             break
-    if VERBOSE and len(controls) < n - 1:
-        print(f"only {len(controls)} of {n - 1} splits reachable", file=sys.stderr)
+    if VERBOSE and len(controls) < len(divs):
+        print(f"only {len(controls)} of {len(divs)} dividers reachable", file=sys.stderr)
 
 
 def main():
@@ -149,19 +196,13 @@ def main():
     if len(wins) < 2:
         return
     active = hyprctl_json("activewindow").get("address")
-    shape = arrangement(wins)
+    tree = split_tree(wins)
 
     smart = hyprctl_json("getoption", "dwindle:smart_resizing").get("bool", True)
     if smart:
         set_smart_resizing(False)
     try:
-        if shape == "grid":
-            calls = []
-            for w in wins:
-                calls += [focus(w["address"]), 'hl.dsp.layout("splitratio 1 exact")']
-            dispatch(*calls)
-        else:
-            equalize_line(shape)
+        equalize(tree)
     finally:
         if smart:
             set_smart_resizing(True)
@@ -169,7 +210,7 @@ def main():
             dispatch(focus(active))
 
     if VERBOSE:
-        print(shape)
+        print(tree)
         for w in sorted(tiled_windows(), key=lambda w: (w["at"][0], w["at"][1])):
             print(f"  {w['class'][:24]:24} at {w['at']}  size {w['size']}")
 

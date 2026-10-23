@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Give every tiled window on the focused workspace an equal share.
+
+Dwindle is a binary tree, so `splitratio 1` only evens out one split. This
+walks every tiled window instead: side-by-side windows get equal widths,
+stacked windows get equal heights, and a mixed grid gets every split set to
+50/50. Focus is put back where it was.
+
+Hyprland on Omarchy takes dispatches as Lua (hl.dsp.*), so that is what
+this sends.
+"""
+import json
+import subprocess
+import sys
+
+VERBOSE = "--verbose" in sys.argv
+
+
+def hyprctl_json(*args):
+    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def dispatch(*lua_calls):
+    """Run several hl.dsp.* calls in one hyprctl batch."""
+    batch = ";".join("dispatch " + c for c in lua_calls)
+    r = subprocess.run(["hyprctl", "--batch", batch], capture_output=True, text=True)
+    if VERBOSE and ("error" in r.stdout.lower() or r.returncode):
+        print(r.stdout, r.stderr, file=sys.stderr)
+
+
+def focus(address):
+    return f'hl.dsp.focus({{ window = "address:{address}" }})'
+
+
+def resize(width, height):
+    return f"hl.dsp.window.resize({{ x = {width}, y = {height} }})"
+
+
+def tiled_windows():
+    mon = next(m for m in hyprctl_json("monitors") if m["focused"])
+    ws = mon["activeWorkspace"]["id"]
+    return [
+        c for c in hyprctl_json("clients")
+        if c["workspace"]["id"] == ws and c["mapped"] and not c["floating"] and not c["hidden"]
+    ]
+
+
+def overlaps(a0, a1, b0, b1):
+    return min(a1, b1) - max(a0, b0) > 8
+
+
+def arrangement(wins):
+    """columns: no two windows share horizontal space; rows: none share vertical."""
+    cols = rows = True
+    for i, a in enumerate(wins):
+        for b in wins[i + 1:]:
+            ax, ay = a["at"]; aw, ah = a["size"]
+            bx, by = b["at"]; bw, bh = b["size"]
+            if overlaps(ax, ax + aw, bx, bx + bw):
+                cols = False
+            if overlaps(ay, ay + ah, by, by + bh):
+                rows = False
+    return "columns" if cols else "rows" if rows else "grid"
+
+
+def set_smart_resizing(on):
+    # `hyprctl keyword` is refused on the Lua config; eval takes the same table hl.config does.
+    lua = "hl.config({ dwindle = { smart_resizing = %s } })" % ("true" if on else "false")
+    subprocess.run(["hyprctl", "eval", lua], capture_output=True)
+
+
+def resize_by(address, dx, dy):
+    dispatch(focus(address), f"hl.dsp.window.resize({{ x = {dx}, y = {dy}, relative = true }})")
+
+
+def equalize_line(shape):
+    """Line windows up by moving each split boundary to its equal-share spot.
+
+    A resize moves the window's parent split, but which way depends on where
+    the window sits in the dwindle tree (for some windows "grow" shrinks them),
+    so absolute per-window resizes can run away to the split clamp. Instead,
+    probe each window once to learn which boundary it moves and in which
+    direction, then drive every boundary to its target.
+    """
+    axis = 0 if shape == "columns" else 1
+    PROBE = 40
+
+    def layout():
+        wins = sorted(tiled_windows(), key=lambda w: (w["at"][axis], w["at"][1 - axis]))
+        return wins, [w["at"][axis] for w in wins[1:]]
+
+    def nudge(address, d):
+        resize_by(address, d, 0) if axis == 0 else resize_by(address, 0, d)
+
+    def probe():
+        controls = {}  # boundary index -> (address, boundary px moved per px of resize)
+        for w in layout()[0]:
+            for d in (PROBE, -PROBE):
+                before = layout()[1]
+                nudge(w["address"], d)
+                after = layout()[1]
+                nudge(w["address"], -d)
+                moved = [a - b for a, b in zip(after, before)]
+                k = max(range(len(moved)), key=lambda i: abs(moved[i]))
+                if abs(moved[k]) >= PROBE / 4:
+                    controls.setdefault(k, (w["address"], moved[k] / d))
+                    break
+        return controls
+
+    n = len(layout()[0])
+    controls = probe()
+    if len(controls) < n - 1:
+        # A split with no window directly under it (e.g. (A|B)|(C|D)) can't be
+        # resized. Hoisting the first window to the root rebuilds the tree so
+        # every split has one; swaps then put the windows back in order.
+        order = [w["address"] for w in layout()[0]]
+        dispatch(focus(order[0]), 'hl.dsp.layout("movetoroot")')
+        step = "l" if axis == 0 else "u"
+        for i, address in enumerate(order):
+            for _ in range(n):
+                now = [w["address"] for w in layout()[0]]
+                if now.index(address) <= i:
+                    break
+                dispatch(focus(address), f'hl.dsp.window.swap({{ direction = "{step}" }})')
+        controls = probe()
+
+    for _ in range(6):
+        wins, bounds = layout()
+        start = wins[0]["at"][axis]
+        end = wins[-1]["at"][axis] + wins[-1]["size"][axis]
+        gap = bounds[0] - (wins[0]["at"][axis] + wins[0]["size"][axis])
+        share = (end - start - gap * (n - 1)) / n
+        worst = 0
+        for k, (address, rate) in sorted(controls.items()):
+            target = start + (k + 1) * (share + gap)
+            err = target - layout()[1][k]
+            worst = max(worst, abs(err))
+            if abs(err) > 2:
+                nudge(address, round(err / rate))
+        if worst <= 2:
+            break
+    if VERBOSE and len(controls) < n - 1:
+        print(f"only {len(controls)} of {n - 1} splits reachable", file=sys.stderr)
+
+
+def main():
+    wins = tiled_windows()
+    if len(wins) < 2:
+        return
+    active = hyprctl_json("activewindow").get("address")
+    shape = arrangement(wins)
+
+    smart = hyprctl_json("getoption", "dwindle:smart_resizing").get("bool", True)
+    if smart:
+        set_smart_resizing(False)
+    try:
+        if shape == "grid":
+            calls = []
+            for w in wins:
+                calls += [focus(w["address"]), 'hl.dsp.layout("splitratio 1 exact")']
+            dispatch(*calls)
+        else:
+            equalize_line(shape)
+    finally:
+        if smart:
+            set_smart_resizing(True)
+        if active:
+            dispatch(focus(active))
+
+    if VERBOSE:
+        print(shape)
+        for w in sorted(tiled_windows(), key=lambda w: (w["at"][0], w["at"][1])):
+            print(f"  {w['class'][:24]:24} at {w['at']}  size {w['size']}")
+
+
+if __name__ == "__main__":
+    main()

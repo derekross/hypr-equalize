@@ -2,15 +2,17 @@
 """Give every tiled window on the focused workspace an equal share.
 
 Dwindle is a binary tree, so `splitratio 1` only evens out one split. This
-rebuilds the layout's rows and columns from window geometry and evens out
-every one: side-by-side windows get equal widths, stacked windows get equal
-heights, and in a mixed grid each row or column is split evenly between the
-groups in it. Focus is put back where it was.
+finds every split on the workspace and moves each one so all tiled windows
+get the same size: side-by-side windows get equal widths, stacked windows
+equal heights, and a regular grid identical cells. A layout that can't come
+out even is re-tiled as a grid of equal windows in reading order. Focus is
+put back where it was.
 
 Hyprland on Omarchy takes dispatches as Lua (hl.dsp.*), so that is what
 this sends.
 """
 import json
+import math
 import subprocess
 import sys
 
@@ -51,144 +53,176 @@ def span(w, axis):
     return w["at"][axis], w["at"][axis] + w["size"][axis]
 
 
-def split_tree(wins):
-    """Rebuild the layout as nested rows and columns from window geometry.
-
-    A tiled layout always splits cleanly: some line runs edge to edge across
-    the region without cutting a window. A node is (axis, [children]); runs of
-    the same split direction are flattened, so (A|B)|C is one node of three.
-    A leaf is a window address.
-    """
-    if len(wins) == 1:
-        return wins[0]["address"]
-    for axis in (0, 1):
-        ordered = sorted(wins, key=lambda w: w["at"][axis])
-        groups = [[ordered[0]]]
-        reach = span(ordered[0], axis)[1]
-        for w in ordered[1:]:
-            if w["at"][axis] >= reach - 2:
-                groups.append([w])
-            else:
-                groups[-1].append(w)
-            reach = max(reach, span(w, axis)[1])
-        if len(groups) > 1:
-            return axis, [split_tree(g) for g in groups]
-    raise RuntimeError("windows don't form a tiled layout")
+def overlaps(a, b, axis):
+    (a0, a1), (b0, b1) = span(a, axis), span(b, axis)
+    return min(a1, b1) - max(a0, b0) > 8
 
 
-def leaves(node):
-    return [node] if isinstance(node, str) else [a for c in node[1] for a in leaves(c)]
+def across(group, axis):
+    """Most windows of the group side by side along axis."""
+    return max(sum(overlaps(v, w, 1 - axis) for v in group) for w in group)
 
 
-def dividers(node, out=None):
-    """Every divider as (axis, its row or column as lists of windows, index of
-    the child it starts), outermost first."""
-    out = [] if out is None else out
-    if not isinstance(node, str):
-        axis, children = node
-        members = [leaves(c) for c in children]
-        out += [(axis, members, i) for i in range(1, len(children))]
-        for c in children:
-            dividers(c, out)
-    return out
+# Dwindle settings this needs while it runs: resizes that move a fixed split,
+# new tiles that split the focused window, and new splits that start at 50/50.
+DWINDLE = {"smart_resizing": False, "use_active_for_splits": True, "smart_split": False, "default_split_ratio": 1.0}
 
 
-def set_smart_resizing(on):
+def get_dwindle():
+    values = {}
+    for name in DWINDLE:
+        opt = hyprctl_json("getoption", f"dwindle:{name}")
+        values[name] = opt["bool"] if "bool" in opt else opt.get("float", opt.get("int"))
+    return values
+
+
+def set_dwindle(values):
     # `hyprctl keyword` is refused on the Lua config; eval takes the same table hl.config does.
-    lua = "hl.config({ dwindle = { smart_resizing = %s } })" % ("true" if on else "false")
-    subprocess.run(["hyprctl", "eval", lua], capture_output=True)
+    fields = ", ".join(f"{k} = {str(v).lower() if isinstance(v, bool) else v}" for k, v in values.items())
+    subprocess.run(["hyprctl", "eval", f"hl.config({{ dwindle = {{ {fields} }} }})"], capture_output=True)
+
+
+def even():
+    """Every tiled window is the same size, give or take dwindle's rounding."""
+    sizes = [w["size"] for w in tiled_windows()]
+    return all(max(s[axis] for s in sizes) - min(s[axis] for s in sizes) <= 16 for axis in (0, 1))
 
 
 def resize_by(address, dx, dy):
     dispatch(focus(address), f"hl.dsp.window.resize({{ x = {dx}, y = {dy}, relative = true }})")
 
 
-def equalize(tree):
-    """Move every divider to the spot that gives its row or column equal shares.
+def equalize():
+    """Give every window an equal share by moving each dwindle split.
 
-    A resize moves one of the window's ancestor splits, but which one, and
-    which way, depends on where the window sits in the dwindle tree (for some
-    windows "grow" shrinks them), so absolute per-window resizes can run away
-    to the split clamp. Instead, nudge each window to learn which divider it
-    moves and in which direction, then drive every divider to its target.
+    If that still leaves windows of different sizes, or some split can't be
+    moved at all, the workspace is re-tiled as an even grid instead.
+
+    Window geometry alone can't say which split is which: when edges line up,
+    a 2x2 block beside a column looks the same as four columns. A resize
+    does: it moves exactly one split, and the windows that change are the two
+    halves of it. So nudge each window along each axis to find the splits
+    and which window moves each one, by how much and which way (for some
+    windows "grow" shrinks them, so absolute resizes can run away to the
+    split clamp). Then drive every split to the spot where each window under
+    it gets the same area.
     """
     PROBE = 40
-    divs = dividers(tree)
 
     def geometry():
         return {w["address"]: w for w in tiled_windows()}
-
-    def position(div, g):
-        axis, members, i = div
-        return min(g[a]["at"][axis] for a in members[i])
 
     def nudge(address, axis, d):
         resize_by(address, d, 0) if axis == 0 else resize_by(address, 0, d)
 
     def probe():
-        controls = {}  # divider index -> (address, axis, divider px moved per px of resize)
-        fallback = {}
-        for address in leaves(tree):
-            for axis in {d[0] for d in divs}:
+        splits = {}  # (axis, before, after) -> (address, split px moved per px of resize)
+        for address in geometry():
+            for axis in (0, 1):
                 for d in (PROBE, -PROBE):
                     g = geometry()
-                    before = [position(v, g) for v in divs]
                     nudge(address, axis, d)
-                    g = geometry()
-                    moved = [position(v, g) - b for v, b in zip(divs, before)]
+                    moved = geometry()
                     nudge(address, axis, -d)
-                    k = max(range(len(moved)), key=lambda i: abs(moved[i]))
-                    if abs(moved[k]) < PROBE / 4:
+                    changed = [a for a in g if span(g[a], axis) != span(moved[a], axis)]
+                    (s0, e0), (s1, e1) = span(g[address], axis), span(moved[address], axis)
+                    edge, shift = (e0, e1 - e0) if abs(e1 - e0) >= abs(s1 - s0) else (s0, s1 - s0)
+                    if abs(shift) < PROBE / 4:
                         continue
-                    controls.setdefault(k, (address, axis, moved[k] / d))
-                    for i, m in enumerate(moved):
-                        if abs(m) >= PROBE / 4 and abs(m) > abs(fallback.get(i, (0, 0, 0))[2] * d):
-                            fallback[i] = (address, axis, m / d)
+                    # Line up the changed windows on either side of the edge
+                    # that moved; the gap between them is the split.
+                    before = frozenset(a for a in changed if span(g[a], axis)[1] <= edge + 2)
+                    after = frozenset(a for a in changed if span(g[a], axis)[0] >= edge - 2 and a not in before)
+                    if before and after and len(before) + len(after) == len(changed):
+                        splits.setdefault((axis, before, after), (address, shift / d))
                     break
-        # A divider that only ever moves alongside a bigger one can still be
-        # driven by whichever window moves it most.
-        return {**fallback, **controls}
+        return splits
 
-    controls = probe()
-    if len(controls) < len(divs) and all(isinstance(c, str) for c in tree[1]):
-        # A split with no window directly under it (e.g. (A|B)|(C|D)) can't be
-        # resized. Hoisting the first window to the root rebuilds the tree so
-        # every split has one; swaps then put the windows back in order.
-        axis, order = tree
-        n = len(order)
+    if even():
+        return
+    wins = tiled_windows()
+    n = len(wins)
+    splits = probe()
+    if len(splits) < n - 1:
+        if VERBOSE:
+            print(f"{len(splits)} of {n - 1} splits reachable, rebuilding as a grid", file=sys.stderr)
+        rebuild(wins)
+        return
 
-        def line():
-            g = geometry()
-            return sorted(order, key=lambda a: (g[a]["at"][axis], g[a]["at"][1 - axis]))
-
-        dispatch(focus(order[0]), 'hl.dsp.layout("movetoroot")')
-        step = "l" if axis == 0 else "u"
-        for i, address in enumerate(order):
-            for _ in range(n):
-                if line().index(address) <= i:
-                    break
-                dispatch(focus(address), f'hl.dsp.window.swap({{ direction = "{step}" }})')
-        controls = probe()
-
+    # Outermost first: moving a split rescales everything inside it.
+    ordered = sorted(splits.items(), key=lambda s: -len(s[0][1] | s[0][2]))
     for _ in range(8):
         worst = 0
-        for k, (address, axis, rate) in sorted(controls.items()):
+        for (axis, before, after), (address, rate) in ordered:
             g = geometry()
-            # Targets come from the divider's own row or column, re-measured
-            # each time since moving an outer divider rescales the inner ones.
-            _, members, i = divs[k]
-            start = min(g[a]["at"][axis] for a in members[0])
-            end = max(span(g[a], axis)[1] for a in members[-1])
-            gap = min(g[a]["at"][axis] for a in members[1]) - max(span(g[a], axis)[1] for a in members[0])
-            share = (end - start - gap * (len(members) - 1)) / len(members)
-            err = start + i * (share + gap) - position(divs[k], g)
+            b, a = [g[x] for x in before], [g[x] for x in after]
+            start = min(span(w, axis)[0] for w in b)
+            end = max(span(w, axis)[1] for w in a)
+            split = min(span(w, axis)[0] for w in a)
+            gap = split - max(span(w, axis)[1] for w in b)
+            # Each side is (its windows) units of area plus the gaps between
+            # its windows, so a regular grid comes out exactly even.
+            xb, xa = across(b, axis), across(a, axis)
+            unit = (end - start - gap * (xb + xa - 1)) / (len(b) + len(a))
+            err = start + len(b) * unit + gap * xb - split
             worst = max(worst, abs(err))
             if abs(err) > 2:
                 nudge(address, axis, round(err / rate))
         if worst <= 2:
             break
-    if VERBOSE and len(controls) < len(divs):
-        print(f"only {len(controls)} of {len(divs)} dividers reachable", file=sys.stderr)
+
+    # Equal area can still mean a short wide window next to a tall thin one
+    # when the tree is lopsided; only a grid gives every window the same size.
+    if not even():
+        if VERBOSE:
+            print("layout can't give every window the same size, rebuilding as a grid", file=sys.stderr)
+        rebuild(wins)
+
+
+def rebuild(wins):
+    """Re-tile the workspace as even columns of stacked windows.
+
+    Some layouts can't be evened out by resizing: dwindle resizes only reach a
+    window's parent or grandparent split, so a split with a whole subtree on
+    each side (a 2x2 block beside two columns, say) never moves. Instead,
+    float every window but the first and tile them back one at a time with
+    `preselect`, keeping their reading order. Halving splits keep the 50/50
+    they start with; an odd split peels off one window, whose parent split
+    `splitratio` can then set. A row or a stack stays one; anything else gets
+    the grid closest to square cells.
+    """
+    n = len(wins)
+    width = max(span(w, 0)[1] for w in wins) - min(span(w, 0)[0] for w in wins)
+    height = max(span(w, 1)[1] for w in wins) - min(span(w, 1)[0] for w in wins)
+    if not any(overlaps(a, b, 0) for a in wins for b in wins if a is not b):
+        rows = 1
+    elif not any(overlaps(a, b, 1) for a in wins for b in wins if a is not b):
+        rows = n
+    else:
+        rows = min(n, max(1, round(math.sqrt(n * height / width))))
+    wins = sorted(wins, key=lambda w: (w["at"][1], w["at"][0]))
+    cols = math.ceil(n / rows)
+    # Reading order, row by row; the last columns are the short ones.
+    grid = [[wins[r * cols + c]["address"] for r in range(rows) if r * cols + c < n] for c in range(cols)]
+
+    for w in wins[1:]:
+        dispatch(focus(w["address"]), 'hl.dsp.window.float({ action = "toggle" })')
+
+    def tile(line, direction):
+        """Tile line[1:] beside line[0], which is already tiled."""
+        if len(line) < 2:
+            return
+        k = len(line) // 2 if len(line) % 2 == 0 else 1
+        dispatch(focus(line[0]), f'hl.dsp.layout("preselect {direction}")',
+                 f'hl.dsp.window.float({{ action = "toggle", window = "address:{line[k]}" }})')
+        if k == 1:
+            dispatch(focus(line[0]), f'hl.dsp.layout("splitratio {2 / len(line):.4f} exact")')
+        tile(line[:k], direction)
+        tile(line[k:], direction)
+
+    tile([column[0] for column in grid], "r")
+    for column in grid:
+        tile(column, "d")
 
 
 def main():
@@ -196,21 +230,17 @@ def main():
     if len(wins) < 2:
         return
     active = hyprctl_json("activewindow").get("address")
-    tree = split_tree(wins)
 
-    smart = hyprctl_json("getoption", "dwindle:smart_resizing").get("bool", True)
-    if smart:
-        set_smart_resizing(False)
+    saved = get_dwindle()
+    set_dwindle(DWINDLE)
     try:
-        equalize(tree)
+        equalize()
     finally:
-        if smart:
-            set_smart_resizing(True)
+        set_dwindle(saved)
         if active:
             dispatch(focus(active))
 
     if VERBOSE:
-        print(tree)
         for w in sorted(tiled_windows(), key=lambda w: (w["at"][0], w["at"][1])):
             print(f"  {w['class'][:24]:24} at {w['at']}  size {w['size']}")
 
